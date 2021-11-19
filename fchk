@@ -1,0 +1,641 @@
+#!/bin/bash
+
+# Сценарий производит поиск "шапок" функций.
+# В качестве параметров указываются:
+#  - каталог, в котором будет рекурсивно осуществляться поиск
+#  - расширения файлов, в которых искать функции с заданными словами для "шапки"
+#  - кодировка, в которой будет производиться поиск
+#  - если хотим вывод на экран,то пишем "screen", иначе результат будет записан в файл: "Название каталога.fchk"
+# Сценарий в каждом из файлов заданного каталога ищет "шапки" функций и
+# выводит результат в логфайл или на экран.
+# 
+# Koryakovsky Dmitriy, NIS-315 , тел. 089
+
+
+#Версия программы
+ver="1.13"
+
+
+#Искомые слова
+# (поля должны быть перечислены через запятую без пробелов между собой)
+fieldsUTF="Назначение","Входные данные","Выходные данные","Код завершения"
+fieldsKOI="����������","������� ������","�������� ������","��� ����������"
+fieldsWIN="����������","������� ������","�������� ������","��� ����������"
+
+#Исключаемые из проверки файлы
+fileexcl="user_task.h im.c itkm.c"
+
+#Исключаемые из проверки каталоги
+direxcl="/target/ /MakeDisk serverOCPB/ /SYSINFO/"
+
+#флаг для исключения из проверки функций со словом extern
+fExcludeExtern=1
+
+#маска файлов по умолчанию
+DftMask=".c .h"
+
+#Максимум строк, в которых будет производиться поиск "шапки" функции
+MAXFuncHeader=30
+
+# Файл библиотечных функций
+UtilsLib="/opt/mfp/UTILITIES/utils.lib"
+
+
+
+#################################################################################
+
+
+
+
+#Минимальное количество точек после самого длинного поля
+min_point=3
+
+#временные файлы
+tmp_file=/tmp/fchk_$$.tmp
+tmp_func=/tmp/list_$$.tmp
+
+#Флаг наличия хотя бы одной неправильной "шапки"
+first_dismatch=0
+
+#Максимум строк для поиска слова "Разработчик" в заголовке файла (в "шапке" файла)
+MAXStrDevHeader=30
+
+#Список файлов состоящих из одной строки или пустых
+ListOfSkip=
+
+ExludeExtern=1
+
+
+fAbout=0
+abtStr="Function CHecK(fchk) $ver | Checking function\`s header(s) in masked files."
+abtColor="Blue"
+
+
+
+
+###################### main cod ##############################################
+
+# удалим временные файлы если скрипт прервут (например CTRL+C)
+trap "rm -f $tmp_file; rm -f $tmp_func; exit" 1 2 5 15
+
+tmp2=`echo "$2" | tr "[:lower:]" "[:upper:]"`
+tmp3=`echo "$3" | tr "[:lower:]" "[:upper:]"`
+
+#Определяем длиннейшее слово из искомых
+savIFS=$IFS
+max_char=0
+IFS=,
+for field in $fieldsUTF; do
+    max_count=`echo $field | wc -c`
+    if [ $max_count -gt $max_char ]; then
+	max_char=$max_count
+    fi
+done
+IFS=$savIFS
+
+
+#Функция заполняет точками свободное пространство между названием поля и результатом
+#Параметры:
+#1 - название поля
+spacer()
+{
+        tmp1=($1)
+	char_of_word=${#tmp1[0]}
+	point_count=`expr $max_char - $char_of_word + $min_point`
+	LANG=C perl -e "print '.' x$point_count;"
+}
+
+
+
+
+#Указание взять библиотеку из текущего каталога в случае, если в указанном ранее имени файла отсутствует
+if [ -f "./$Utils_Lib" ]; then
+    Utils_Lib="./$Utils_Lib"
+fi
+
+#Проверяем, существует ли файл библитечных функций утилит
+if [ ! -f $Utils_Lib ]; then
+    if [ -f "`dirname $0`/`basename $Utils_Lib`" ]; then
+        Utils_Lib="`dirname $0`/`basename $Utils_Lib`"
+    else
+        echo "Error: Нет файла \"$Utils_Lib\"!"
+        exit 1
+    fi
+fi
+
+
+# подключим Файл библиотечных функций утилит
+. $UtilsLib
+
+
+
+if [ $# -le 1 ] || ( [ "$tmp2" != "UTF" ] && [ "$tmp2" != "KOI" ] && [ "$tmp2" != "WIN" ] && [ "$tmp3" != "UTF" ] && [ "$tmp3" != "KOI" ] && [ "$tmp3" != "WIN" ] ); then
+    SuperEcho "USAGE: `basename $0` work_path \"fileexts\" {UTF|KOI} [screen]\n"
+    SuperEcho "EX1: `basename $0` /home/PROJECTS \".c .h .asm\" UTF           -result in PROJECTS.fchk\n"
+    SuperEcho "EX2: `basename $0` /home/PROJECTS \".c .h .asm\" KOI screen    -result on screen\n"
+    SuperEcho "\nOUTPUT: V - is OK(word found), X - is ERROR(word not found)\n\n"
+    exit
+fi
+
+
+#определим маску обрабатываемых файлов
+if [ "`echo $2 | grep -Ew 'UTF|KOI|WIN'`" == "" ]; then 
+    filemasks=$2
+    Encoding=$3
+else
+    filemasks="$DftMask"
+    Encoding=$2
+fi
+
+#Директория поиска
+dir_of_projects=$1
+
+#Проверка на наличие указанной директории
+if [ ! -d "$dir_of_projects" ]; then
+   SuperEcho -fg Red "Directory \"$dir_of_projects\" not found!!!\n\n"
+   exit
+fi
+
+
+#Кодировка
+case $Encoding in
+     UTF)
+         #переменная, в которой лежат поля в текущей кодировке
+         fields=$fieldsUTF
+         LANG="ru_RU.UTF-8"
+         #альтернативная кодировка
+         AltEncoding="KOI8-R"
+         #переменная для вывода результата при неверной кодировке
+         EncodingForRez="UTF-8"
+         ;;
+     KOI)
+         fields=$fieldsKOI
+         LANG="ru_RU.KOI8-R"
+         AltEncoding="UTF-8"
+         EncodingForRez="KOI8"
+         ;;
+     WIN)
+         fields=$fieldsWIN
+         LANG="ru_RU.cp1251"
+         AltEncoding="UTF-8"
+         EncodingForRez="KOI8"
+         ;;
+esac
+
+
+#Если результат выводим на экран, то логфайл !!!, иначе записываем в него "шапку" программы
+if [ "`echo $@ | grep -i 'screen'`" != "" ]; then
+  OFFLOG=1
+  logfile=""
+  SuperEcho  -log $logfile "Encoding={$LANG}, FileMask={$filemasks}, Date={`date`}\n\n"
+else
+  logfile=`basename "$1".fchk`
+  rm -f $logfile
+  SuperEcho "LOGfile: $logfile\n\n"
+  OFFSCREEN=1
+  SuperEcho -log $logfile "Function CHecK(fchk) $ver | Encoding={$LANG}, FileMask={$filemasks}, Date={`date`}\n\n"
+fi
+
+#Переменная для создания списка разработчиков, у которых ошибки в "шапках" функций
+listOfDevelopers=""
+
+#Счетчик общего количества файлов
+CountAllFiles=0
+
+#Счетчик количества файлов с ошибками
+CountBadFiles=0
+#######################################################################################
+
+# Список файлов
+listOfFiles=""
+
+# Создаем список файлов для проверки
+for type in $filemasks; do
+    if [ "${endingType}" == "" ]; then
+        endingType="*$type"
+    else
+        endingType+=" -or -name *$type"
+    fi
+done
+
+listOfFiles="`find $dir_of_projects -type f -name $endingType 2>/dev/null | sort`"
+
+# Удаляем файлы, которые добавлены в исключния
+for excludeFile in $fileexcl; do 
+    listOfFiles=`echo "$listOfFiles" | sed /$excludeFile/d`
+done
+
+
+
+# Удаляем файлы, в имени которых присутсвует каталоги-исключения
+for excludeDirectory in $direxcl ; do 
+    excludeDirectory=`echo "${excludeDirectory}" | sed 's/\//\\\\\//g'`
+    listOfFiles=`echo "$listOfFiles" | sed "/${excludeDirectory}/d"`
+done
+
+
+listOfFiles=`echo "$listOfFiles" | sort -sdf`
+
+
+# Главный цикл обработки
+for currentFile in $listOfFiles; do
+
+
+    # Считаем количество обработанных файлов
+    ((CountAllFiles++))
+
+    # Выводим количество обработанных файлов
+    if [ "$logfile" != "" ]; then
+        echo -en "Processed file N: $CountAllFiles\r"
+    fi
+
+    # Сомнительный функционал
+    # Если файл состоит не более чем из одной строки, то пропускаем его
+    # Подсчёт общего количества строк в текущем файле
+    max_str=`wc -l "${currentFile}" | awk {'print $1'}`
+    if [ "$max_str" -lt 1 ]; then
+        OFFSCREEN=0
+        [ "$logfile" != "" ] && SuperEcho -fg Yellow "Skipped file(too short): \"${currentFile}\"\n"
+        ListOfSkip=${ListOfSkip}${currentFile}"\n"
+        OFFSCREEN=1
+        continue
+    fi
+
+    # Удаляем временный файл
+    if [ -f "${tmp_file}"  ]; then
+        rm -f ${tmp_file}
+    fi
+
+    SuperEcho -log $tmp_file "\n\n-----------------------------------------------------------------------------------------------\n${currentFile}:\n"
+    #Переменная для поиска "разработчика" в "шапке" файла
+    case $Encoding in
+        UTF)
+           DevInHeader=`grep -i 'разработчик' "${currentFile}"`
+           ;;
+        KOI)
+           DevInHeader=`grep -i '�����������' "${currentFile}"`
+           ;;
+        WIN)
+           DevInHeader=`grep -i '�����������' "${currentFile}"`
+           ;;
+    esac
+
+    if [ "$DevInHeader" = "" ]; then
+       SuperEcho -log "$tmp_file" "Developer not found!\n\n"
+    else
+       SuperEcho -log $tmp_file "$DevInHeader\n\n"
+    fi
+
+    #флаг если нашли хотя бы одно корректное поле
+    FGoodField=0
+
+    #флаг если нашли хотя бы одно некорректное поле в "шапке" функции данного файла.
+    flag_of_dismatch=0
+
+    ExcludeExtern=0
+
+    #номер текущей строки в текущем файле 
+    CurrentLineNum=1
+
+    #номер строки с началом "шапки"
+    HeaderBeginNum=1
+
+    #номер строки с концом "шапки"
+    HeaderEndNum=1
+
+    #счетчик количества функций в файле
+    count_func=0
+
+    #счетчик блочных комментариев
+    Comment=0
+
+    #переменная для подсчёта плохих функций
+    bad_count_func=0
+
+
+
+    # Счетчик плохих функций
+    counterBadlyFunction=0
+
+    # Считает количество открытых блоков
+    counterOfOpenedBlocks=0
+
+    # Текущий номер строки текущего файла
+    currentLineNumber=""
+
+    # Количесво строк в файле
+    quantityOfStringFromFile=`wc -l "${currentFile}" | awk '{print$1}'`
+
+    # Список строк с функциями
+    listOfFunctionNumberLine=""
+
+    # Верхняя граница для шапки
+    theUpperLimit=1
+
+    # Список номеров строк, в которых встречаеться объявление функций
+    listOfFunctionNumberLine=""
+
+    #Счетчик открытых комментариев
+    fOpenedCommentary=0
+
+    quantityOfMatches=0
+
+
+
+    # Просматриваем файл построчно
+    for ((currentLineNumber=1; currentLineNumber<quantityOfStringFromFile; currentLineNumber++)) ; do
+
+        # Строка файла
+        fileLine=`sed -n ${currentLineNumber},${currentLineNumber}p ${currentFile}`
+
+
+        # Пропускаем пустые строки
+        if [ "`echo "${fileLine}" | sed 's/[ \t]//g'`" == "" ]; then
+            continue
+        fi
+
+        # Переключаем счетчик если нашли открывающий комментарий
+        if [ "`echo "${fileLine}" | grep '^[ \t]*/\*'`" != "" ] ; then
+            fOpenedCommentary=1
+        fi
+
+        # Переключаем счетчик если нашли закрывающий комментарий
+        if [ "`echo "${fileLine}" | grep '\*/'`" != "" ]; then
+            fOpenedCommentary=0
+        fi
+
+
+        # Увеличиваем счетчик если находим открывающую скобку
+        quantityOfMatches=`echo "${fileLine}" | grep -o '{' | wc -l`
+        if [ ${quantityOfMatches} -gt 0 ] ; then
+        #    echo "+${fileLine}"
+           [ "`echo "${fileLine}" | grep '^[ \t]*//'`" == "" -o "${fOpenedCommentary}" == 0  ] && ((counterOfOpenedBlocks+=quantityOfMatches))
+        fi
+
+        # Уменьшаем счетчик если находим закрывающую скобку
+        quantityOfMatches=`echo "${fileLine}" | grep -o '}' | wc -l`
+        if [ ${quantityOfMatches} -gt 0 ]; then
+        #    echo "-${fileLine}"
+            [ "`echo "${fileLine}" | grep '^[ \t]*//'`" == "" -o "${fOpenedCommentary}" == 0  ] &&((counterOfOpenedBlocks-=quantityOfMatches))
+        fi
+
+        # Если строка закоменчена, находится в открытом блоке кода, являеться прототипом или на конце строки присутствует символ "\", то переходим к следующей итерации
+        if [ "`echo "${fileLine}" | grep '^[ \t]*//'`" != ""  ] || [ "${fOpenedCommentary}" == 1 ] || [ ${counterOfOpenedBlocks} -gt 1 ] || [ "`echo "${fileLine}" | grep ')[ \t]*;'`" != "" ] || [ "`echo "${fileLine}" | grep '\\\\$'`" != "" ]; then
+            continue
+        fi
+
+        # Паттерн вызова или объявления какой-либо функции
+        function="`echo "${fileLine}" | grep -o '^[ ]*[a-Z]*[ ]*[a-Z]*[ ]*[a-Z|\*]\+ \+[\*|0-Z|_]\+ *('`"
+
+#        echo "${fileLine}||${function}"
+        # Устанавливаем флаг того что функция объявлена где-то в другом файле
+        if [ "`echo ${fileLine} | grep '^[ ]*extern '`" != "" ] && [ "$fExcludeExtern" == 1 ]; then
+            # Присваиваем текущей строчке свойство externable
+            externable=1
+        else
+            # Сбрасываем свойство externable для текущей строчки
+            externable=0
+        fi
+
+        # Если в строке содержиться ОБЪЯВЛЕНИЕ функци
+        #  # Есть имя функции       # Количество не закрытых блоков кода меньше 1( оставляем единицу на случай int func(){)    # Функция не является обладатателем свойства externable
+
+        if [ "${function}" != "" ] && [ ${counterOfOpenedBlocks} -eq 0  -o  ${counterOfOpenedBlocks} -eq 1 -a "`echo ${fileLine} | grep '{'`" != "" ]               && [ "${externable}" == 0  ]; then
+             listOfFunctionNumberLine+=" ${currentLineNumber}"
+        fi
+
+
+
+    done  # Просматриваем файл построчно и выписываем интересные для нас строки
+
+    # Верхний предел поиска шапки
+    theUpperHeaderLimit=1
+
+    # Цикл поиска шапок функций
+    for currentFunctionLineNumber in ${listOfFunctionNumberLine}; do
+
+        # Определяем верхнюю границу шапки
+        if [ ${currentFunctionLineNumber} -gt 30  ]; then
+            ((theUpperHeaderLimit=currentFunctionLineNumber-30))
+        else
+              theUpperHeaderLimit=1
+        fi
+
+        # Номер строки начала шапки
+        beginHeaderLineNumber=""
+
+        # Номер строки конца шапки
+        finalHeaderLineNumber=""
+
+        # Флаг, что мы нашли конец шапки
+        fHeaderFounded=0
+
+        # Тип комментария "//" - 1 и "/*....*/" - 2
+        commentType=0
+
+
+        # Цикл поиска начала и конца шапки
+        for ((currentHeaderLineNumber=currentFunctionLineNumber-1; currentHeaderLineNumber >= theUpperHeaderLimit; currentHeaderLineNumber--)); do
+
+            currentHeaderLine=`sed -n ${currentHeaderLineNumber},${currentHeaderLineNumber}p ${currentFile}`
+
+
+            # Ищем конец шапки, если он еще не был найден
+            if [ "${fHeaderFounded}" ==  0 ]; then
+
+                # Строка пустая, поднимаем верхний предел и переходим к следующей итерации
+                if [ "`echo "${currentHeaderLine}" | sed 's/[ \t]//g'`" == "" ]; then
+                    continue
+
+                # Нашли конец шапки вида // - выставлем нужные нам флаги
+                elif [ "`echo "${currentHeaderLine}" | grep '[ \t]*//'`" != "" ]; then
+                    finalHeaderLineNumber="${currentHeaderLineNumber}"
+                    fHeaderFounded=1
+                    commentType=1
+
+                # Нашли конец шапки вида */ - выставляем нужные нам флаги
+                elif [ "`echo "${currentHeaderLine}" | grep '.*\*/'`" != "" ]; then
+                    finalHeaderLineNumber=${currentHeaderLineNumber}
+                    fHeaderFounded=1
+                    commentType=2
+
+                # Прерываем поиск конца шапки, если нашли что-то непонятное
+                else
+                    break
+                fi
+
+# функционал, который ограничивает размер шапки до 30 строк
+#                # Если нашли конец шапки то сдвигаем границу поиска шапки
+#                if [ ${finalHeaderLineNumber} -gt 31  ]; then
+#                     let theUpperHeaderLimit=${finalHeaderLineLimit}-30
+#                else
+#                     let theUpperHeaderLimit=1
+#                fi
+
+            # Ищем начало шапки
+            else
+
+                # Если для первого типа комментариев мы нашли пустую строку, то предыдущая строка была началом шапки
+                if [ "${commentType}" == 1  ] && [ "`echo "${currentHeaderLine}" | grep '^[ \t]*//'`" == "" ]; then
+                    let beginHeaderLineNumber=${currentHeaderLineNumber}+1
+                    break
+                # Если для второго типа комментариев мы нашли строку вида /*, то это начало шапки
+                elif [ ${commentType} == 2  ] &&  [ "`echo "${currentHeaderLine}" | grep '^[ \t]*/\*'`" != "" ]; then
+                    let beginHeaderLineNumber=${currentHeaderLineNumber}
+                    break
+                # Ищем начало шапки до первой строки файла
+                else
+                    [ ${theUpperHeaderLimit} -gt 1  ] && ((theUpperHeaderLimit--))
+                fi
+
+            fi
+            # Ищем начало шапки
+#            echo "${currentFile}::${beginHeaderLineNumber},${finalHeaderLineNumber}::${commentType}"
+
+        done     # Цикл поиска начала и конца шапки
+
+        if [ "${fHeaderFounded}" == 1 ] && [ "${beginHeaderLineNumber}" == ""  ]; then
+            if [ ${finalHeaderLineNumber} -gt 31  ]; then
+                let beginHeaderLineNumber=${finalHeaderLineNumber}-30
+            else
+                beginHeaderLineNumber=1
+            fi
+        fi
+
+
+        # Флаг для одной шапки
+        bad_func_flag=0
+
+        keeperIFS=${IFS}
+        IFS=,
+
+        # Цикл поиска полей в шапке, а также запись результат в файл
+        for field in ${fields}; do
+            echo -n "${field}" >> ${tmp_func}
+            spacer ${field} >> ${tmp_func}
+
+            # Если не нашли поле в шапке
+            if [ "${fHeaderFounded}" == "1" ] && [ "`sed -n ${beginHeaderLineNumber},${finalHeaderLineNumber}p ${currentFile} | grep -i "${field}"`" != "" ]; then
+                FGoodField=1
+                echo -e "${COLORrezGreen}V${COLORrezEnd}" >> ${tmp_func}
+            else
+                flag_of_dismatch=1
+                bad_func_flag=1
+                echo -e "${COLORrezRed}X${COLORrezEnd}" >> ${tmp_func}
+            fi
+
+        done # Цикл поиска полей в шапке, а также запись результат в файл
+
+
+        IFS=${keeperIFS}
+
+        # Записываем в файл строку с функцией и с ошибкой в шапке
+        echo -e "`sed -n ${currentFunctionLineNumber},${currentFunctionLineNumber}p ${currentFile}`\n" >> $tmp_func
+
+        # Формируем список разработчиков с ошибками в "шапках" функций
+        if [ "${bad_func_flag}" == 1 ]; then
+
+            # Увеличиваем счетчик плохих функций
+            let bad_count_func=${bad_count_func}+1
+
+            # Записываем имя хулигана
+            if [ "`echo -e "$ListOfDevelopers" | grep -F "$DevInHeader"`" == "" ]; then
+              ListOfDevelopers=$ListOfDevelopers$DevInHeader"\n"
+            fi
+        fi
+
+        # Счетчик общего количества функций в файле
+        let count_func=${count_func}+1
+
+
+        # Записываем в файл результат обработки "шапки" функции, если нашли несоответствие
+        if [ "$bad_func_flag" == 1 ]; then
+           cat "$tmp_func" >> "$tmp_file"
+        fi
+
+        # Удаляем временный файл для функций
+        if [ -f ${tmp_func} ]; then
+            rm -f ${tmp_func}
+        fi
+
+    done    # Цикл поиска шапок функций по строкам функций
+
+
+
+    echo -e "FUNCTIONS WITH INCORRECT \"HEADER\": $bad_count_func of $count_func\n" >> $tmp_file
+    if [ "${bad_count_func}" != 0 ]; then
+       let CountBadFiles=$CountBadFiles+1
+    fi
+
+    #если нашли хоть одну некорректную "шапку" функции в текущем проверяемом файле, то выдаем информацию к общему результату(на экран или в файл)
+    if [ "${flag_of_dismatch}" == 1 ]; then
+
+        # Eсли кодировка неверная, то заменяем данные по шапкам функций на сообщение об ошибке
+        if [ "${FGoodField}" == 0 ] && [ "${bad_func_flag}" == 1 ] && [ "`enca -L ru -r ${currentFile}`" == "$AltEncoding" ]; then
+            echo -e "-----------------------------------------------------------------------------------------------" > $tmp_file
+            echo -e "File ${currentFile} in wrong encoding (must be $EncodingForRez) !!!\n\n" >> $tmp_file
+        fi
+
+        #переменная показывает, что мы нашли хотя бы одну некоррекную "шапку" во всех проверяемых файлах
+        first_dismatch=1
+
+        # Записываем все что узнали про файл в основной лог
+        if [ "$logfile" != "" ]; then
+            cat $tmp_file >> $logfile
+        else
+            cat $tmp_file
+        fi
+
+    fi
+
+done  # Просматриваем все файлы
+
+
+
+#Определение факта отсутствия имени разработчика хотя бы в одном из обработанных файлов
+HeaderWithoutDev=`grep 'found' "$tmp_file"`
+
+echo > $tmp_file
+
+#Пишем есть ли ошибки и выводим авторов, у которых неправильно написанны "шапки" функций
+if [ "${first_dismatch}" == 1 ]; then
+   echo -e "\n\n\033[31;1mIncorrect function\`s header(s) found ($CountBadFiles from $CountAllFiles file(s)) !!!\033[0;0m\n\n"
+   echo -e "#############################################################################################\n" >> $tmp_file
+   if [ "$logfile" != "" ]; then
+      echo -e "\nIncorrect function\`s header(s) found ($CountBadFiles from $CountAllFiles file(s)) !!!\n\n"  >> $tmp_file
+   fi
+else
+   echo -e "\n\n\033[32;1mNo incorrect function\`s header found (from $CountAllFiles file(s)).\033[0;0m\n\n"
+   echo -e "#############################################################################################\n" >> $tmp_file
+   if [ "$logfile" != "" ]; then
+      echo -e "\nNo incorrect function\`s header found (from $CountAllFiles file(s))." >> $tmp_file
+   fi
+fi
+
+#Выводим список пропущенных файлов, если они были
+if [ "$ListOfSkip" != "" ]; then
+  echo -e "Skipped files:" >> $tmp_file
+  echo -e "$ListOfSkip" | sort >> $tmp_file
+fi
+
+echo -e "\n\nDevelopers with incorrect function\`s header(s):" >> $tmp_file
+echo -e "$ListOfDevelopers" | sort -u >> $tmp_file
+
+
+#Пишем, если есть файлы без автора
+if [ "$HeaderWithoutDev" != "" ]; then
+   echo -e "Some files without the author !!!" >> $tmp_file
+fi
+
+echo -e "\n\n" >> $tmp_file
+
+if [ "$logfile" == "" ]; then
+   cat $tmp_file
+else
+   cat $tmp_file >> $logfile
+fi
+
+
+#Удаляем временные файлы
+rm -f $tmp_file
+rm -f $tmp_func
